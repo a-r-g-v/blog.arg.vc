@@ -1,0 +1,250 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Tags on blog.arg.vc</title>
+    <link>https://blog.arg.vc/tags/</link>
+    <description>Recent content in Tags on blog.arg.vc</description>
+    <generator>Hugo -- gohugo.io</generator>
+    <language>ja-JP</language>
+    
+	<atom:link href="https://blog.arg.vc/tags/index.xml" rel="self" type="application/rss+xml" />
+    
+    
+    
+    <item>
+      <title>Cloud Tasks向けのTransactional Outboxワーカーを実装する</title>
+      <link>https://blog.arg.vc/post/20221231-cloud-tasks-outbox-worker/</link>
+      <pubDate>Sat, 31 Dec 2022 00:00:00 +0900</pubDate>
+      
+      <guid>https://blog.arg.vc/post/20221231-cloud-tasks-outbox-worker/</guid>
+      <description>&lt;h1 id=&#34;背景&#34;&gt;背景&lt;/h1&gt;
+&lt;p&gt;現代的なデータベース駆動アプリケーションでは、メインとなるデータベースに加えて、Web API等を利用して他のシステムと連携することが避けられません。
+例えば、外部決済システムと接続することを考えると、まず決済をAPI経由等で実行した上で、その結果に応じてデータベースの更新を行う必要があります。&lt;/p&gt;
+&lt;p&gt;このような場合に発生する典型的な懸念として、メインデータベースと外部システムのリソース間の不整合があります。
+外部システムのリソース更新とメインデータベースのトランザクションコミットのどちらか片方が失敗するケースが考えられるからです。
+例えば、先程の決済システムの例では、決済が成功したがデータベースのコミットに失敗した場合が考えられます。
+このケースでは、ユーザーの残高は引き落とされているがアプリケーションとしてはそれを認識していない（＝未決済状態）という過払いの状態になるため、問題です。&lt;/p&gt;
+&lt;p&gt;このようなリソース不整合問題に対して、トランザクションマネージャやSaga, TCCパターンなどのさまざまな解決策が知られています。
+その中の1つの手軽な解決策として、冪等キー等を用いてロジック全体をリトライ可能にした上で、無限リトライを実施するという方法が存在します。
+しかし、データベース駆動アプリケーションがWeb APIの場合、無限リトライを期待することはできません。ユーザーの離脱により、リトライを実行するコンポーネントがなくなってしまうためです。&lt;/p&gt;
+&lt;p&gt;このようなケースで無限リトライをトリガーできるSaaSとして、&lt;a href=&#34;https://cloud.google.com/tasks?hl=ja&#34;&gt;Google Cloud Tasks&lt;/a&gt;があります。
+Cloud Tasksを利用することで、HTTPリクエストを無限リトライするキューを作ることができます。&lt;/p&gt;
+&lt;h2 id=&#34;課題&#34;&gt;課題&lt;/h2&gt;
+&lt;p&gt;Cloud Tasksにエンキューをするためには、&lt;a href=&#34;https://cloud.google.com/tasks/docs/reference/rest/v2beta3/projects.locations.queues.tasks/create&#34;&gt;TasksリソースをAPI経由で作成&lt;/a&gt;する必要があります。
+そのため、UX都合などで、ユーザーリクエスト契機でデータベースをすぐに更新する必要がある場合、
+ユーザーリクエスト同期でデータベースを更新した上でCloud TasksのAPIをコールする必要があります。&lt;sup id=&#34;fnref:1&#34;&gt;&lt;a href=&#34;#fn:1&#34; class=&#34;footnote-ref&#34; role=&#34;doc-noteref&#34;&gt;1&lt;/a&gt;&lt;/sup&gt;&lt;/p&gt;
+&lt;p&gt;そのため、このようなケースにおいては、データベースとCloud Tasks間のリソース整合性の検討をする必要があります。&lt;/p&gt;
+&lt;h2 id=&#34;実装&#34;&gt;実装&lt;/h2&gt;
+&lt;p&gt;この問題を解決するために、&lt;a href=&#34;https://microservices.io/patterns/data/transactional-outbox.html&#34;&gt;Transactional Outboxパターン&lt;/a&gt;を用いてTaskエンキューを行うワーカーを作成しました。
+ざっくりいうと、タスク作成キューをデータベースに設け、そのキューを監視してCloud Tasks APIをコールする常時起動ワーカーを作成するという方法です。&lt;/p&gt;
+&lt;p&gt;大まかな仕組みを説明します。
+APIハンドラはタスクエンキューのために同期的にCloud TaskのAPIを叩く代わりに、ステータス=未処理でタスク作成依頼用テーブルに1行インサートするようにします。
+常時起動ワーカーは定期的(100ms等)にステータス=未処理のタスク作成依頼用レコードを全件フェッチし、1行ごとに1TasksをCloud Tasks APIをコールしてエンキューするようにした後、ステータスを処理済みに更新します。&lt;/p&gt;
+&lt;figure class=&#34;center&#34;&gt;&lt;img src=&#34;https://blog.arg.vc/images/20221231-seq.png&#34; width=&#34;1184&#34; height=&#34;588&#34;/&gt;&lt;figcaption&gt;
+            &lt;h4&gt;シーケンス図&lt;/h4&gt;
+        &lt;/figcaption&gt;
+&lt;/figure&gt;
+
+&lt;h2 id=&#34;評価&#34;&gt;評価&lt;/h2&gt;
+&lt;p&gt;このワーカーにより、データベース状態とTask作成のリソース整合性が担保されるようになりました。
+Taskでは無限リトライが発生するので、Task内をリトライ可能に実装することができれば、外部API呼び出しやDB更新のリソース整合性をケアできるようになりました。&lt;/p&gt;
+&lt;p&gt;副次的な効果として、バックグラウンドタスクを気軽に実行できるようになりました。
+Cloud Runを使用している場合、リクエストを処理していない時間はCPUが止まってしまいます。
+そのため、リクエスト非同期のタスクを処理する仕組みが必要です。この方法はデータベースに値挿入するだけでタスクのエンキューを行うことができるため、
+リクエスト非同期のタスクを簡単にエンキューすることができるようになりました。&lt;/p&gt;
+&lt;p&gt;一方で、常時起動インスタンスを利用している関係上、ランニングコストが高くなっています。現状、Cloud Runでは常時起動インスタンスを利用すると70USD/月が課金されていまいます。
+リアルタイム性がさほど重要でないシステムであれば、Taskエンキューを行うワーカーはバッチとして実装することで、インフラ費用を削減することができます。&lt;/p&gt;
+&lt;hr&gt;
+&lt;div class=&#34;footnotes&#34; role=&#34;doc-endnotes&#34;&gt;
+&lt;hr&gt;
+&lt;ol&gt;
+&lt;li id=&#34;fn:1&#34;&gt;
+&lt;p&gt;リアルタイム性が強く求められない場合、APIハンドラで同期的にDBを更新せずCloud Tasksにエンキューするだけで十分です。このケースでは、Taskハンドラ側でDB更新や外部リソース作成の処理を担当させます。&amp;#160;&lt;a href=&#34;#fnref:1&#34; class=&#34;footnote-backref&#34; role=&#34;doc-backlink&#34;&gt;&amp;#x21a9;&amp;#xfe0e;&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ol&gt;
+&lt;/div&gt;
+</description>
+    </item>
+    
+    
+    
+    <item>
+      <title>Cloud EndpointsでgRPCのエラー詳細をレスポンスに含める</title>
+      <link>https://blog.arg.vc/post/20221230-cloud-endpoints-error-detail/</link>
+      <pubDate>Fri, 30 Dec 2022 00:00:00 +0900</pubDate>
+      
+      <guid>https://blog.arg.vc/post/20221230-cloud-endpoints-error-detail/</guid>
+      <description>&lt;h1 id=&#34;tldr&#34;&gt;TL;DR&lt;/h1&gt;
+&lt;p&gt;Google Cloud Endpointsを利用してgRPCサーバーをHTTP JSON APIサーバーに変換する場合で、エラー表現にRicher error modelを利用するケースにおいては
+&lt;code&gt;google/rpc/error_details.proto&lt;/code&gt; を proto descriptor setに含める（Protocol Buffer ファイルから import する）ことで、エラー詳細がレスポンスペイロードにJSONオブジェクトとして返却されるようになります。&lt;/p&gt;
+&lt;h1 id=&#34;背景&#34;&gt;背景&lt;/h1&gt;
+&lt;p&gt;Google Cloud Endpointsを利用すると、gRPCで実装されたサーバーを一般的なHTTP JSON APIサーバーに変換することができます。
+この変換は、&lt;a href=&#34;https://github.com/GoogleCloudPlatform/esp-v2&#34;&gt;Extensible Service Proxy V2（ESPv2）&lt;/a&gt; と呼ばれる Envoy ベースのゲートウェイサーバーを利用して行います。
+ESPv2では、Envoy の &lt;a href=&#34;https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/grpc_json_transcoder/v3/transcoder.proto&#34;&gt;gRPC-JSON transcoder&lt;/a&gt; 機能を用いて変換処理を行っています。&lt;/p&gt;
+&lt;p&gt;また、一般にgRPCを利用されたサーバーでエラーを表現する場合、&lt;a href=&#34;https://grpc.io/docs/guides/error/&#34;&gt;「Standard error model」と「Richer error model」という2つの方法が知られています。&lt;/a&gt;
+Standard error modelは単純な&lt;a href=&#34;https://grpc.github.io/grpc/core/md_doc_statuscodes.html&#34;&gt;gRPC ステータスコード&lt;/a&gt;を利用してエラーを表現する方法です。
+Richer error modelは、事前にエラー詳細のフォーマットを規定しておき、メタデータにその情報を詰めてレスポンスすることで、ステータスコードよりも多くのエラー情報を表現することができる方法です。
+例えば、&lt;a href=&#34;https://cloud.google.com/apis/design/errors#error_model&#34;&gt;GoogleのAPI設計ガイドのエラー&lt;/a&gt;では、Google APIs でのRicher error modelの適用例を知ることができます。&lt;/p&gt;
+&lt;h1 id=&#34;問題&#34;&gt;問題&lt;/h1&gt;
+&lt;p&gt;前述の通り、Richer error modelではエラー詳細をメタデータに詰めてレスポンスします。
+一方で、一般的なHTTP JSON APIサーバーでのエラーの表現方法は、レスポンスペイロードにエラーを表現するJSONオブジェクトを詰めて返却することです。
+よって、何も工夫せずにGoogle Cloud Endpointsを利用すると、エラー詳細はレスポンスのHTTPヘッダー &lt;code&gt;grpc-status-details-bin&lt;/code&gt; に詰められて返却されていまいます。
+そのため、APIクライアントはHTTPヘッダーのエラー詳細をパーズして、エラーハンドリングを行う必要が発生してしまいます。
+&lt;a href=&#34;https://github.com/shumbo/grpc-web-error-details&#34;&gt;これを行うライブラリ&lt;/a&gt;はありますが、余計な手間をAPIクライアントに押し付けることは問題です。&lt;/p&gt;
+&lt;p&gt;あるべき姿は、通常のHTTP JSON APIサーバーと同様に、エラー詳細をレスポンスペイロードにJSONオブジェクトとして返却することです。&lt;/p&gt;
+&lt;h1 id=&#34;対処方法&#34;&gt;対処方法&lt;/h1&gt;
+&lt;p&gt;EnvoyのgRPC-JSON transcoderには&lt;a href=&#34;https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/grpc_json_transcoder/v3/transcoder.proto&#34;&gt;機能フラグ&lt;code&gt;convert_grpc_status&lt;/code&gt;&lt;/a&gt;が存在しており、これを有効にするとHTTPヘッダー&lt;code&gt;grpc-status-details-bin&lt;/code&gt;に含まれる
+エラー詳細をデコードし、レスポンスペイロードにJSONオブジェクトを詰めて返却してくれます。この機能を利用することで、問題を解消することができます。&lt;a href=&#34;https://github.com/GoogleCloudPlatform/esp-v2/blob/6f914c6798b3239645935cfca64b61f33b6a9dab/src/go/configgenerator/filterconfig/filter_generator.go#L324&#34;&gt;また、ESPv2ではこの機能フラグは有効になっています。&lt;/a&gt;
+しかし、私の環境では何故かこの機能が動作していませんでした。&lt;/p&gt;
+&lt;p&gt;原因は、&lt;code&gt;proto descriptor set&lt;/code&gt;に &lt;a href=&#34;https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto&#34;&gt;&lt;code&gt;google/rpc/error_details.proto&lt;/code&gt;&lt;/a&gt; を含めていないことでした。
+Envoyの公式ドキュメントには以下の記述があります。&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;In order to transcode the message, the google.rpc.RequestInfo type from the google/rpc/error_details.proto should be included in the configured proto descriptor set.&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;よって、このファイルを protoc を実行するプロジェクトに配置した上で、Protocol Buffer ファイルから &lt;code&gt;google/rpc/error_details.proto&lt;/code&gt; を import する必要がありました。
+上記を実施することで、エラー詳細がレスポンスペイロードにJSONオブジェクトとして返却されるようになりました。&lt;/p&gt;
+</description>
+    </item>
+    
+    
+    
+    <item>
+      <title>Cloud FunctionsでSSL/TLS証明書の有効期限チェッカーを実装する</title>
+      <link>https://blog.arg.vc/post/20221229-cloud-functions-certificate-expiration-checking/</link>
+      <pubDate>Thu, 29 Dec 2022 00:00:00 +0900</pubDate>
+      
+      <guid>https://blog.arg.vc/post/20221229-cloud-functions-certificate-expiration-checking/</guid>
+      <description>&lt;h1 id=&#34;背景&#34;&gt;背景&lt;/h1&gt;
+&lt;p&gt;現代でもLet&amp;rsquo;s encryptが利用できないような環境においては、SSL/TLS証明書の手動更新を実施する必要があります。
+このようなSSL/TLS証明書の有効期限の管理は煩雑で忘れがちです。そのため、有効期限が近くなった場合にSlackなどに通知するシステムを利用することはよくあると思います。
+著名なところでは、&lt;a href=&#34;https://ja.mackerel.io/&#34;&gt;Mackerel&lt;/a&gt;や&lt;a href=&#34;https://cloud.google.com/monitoring/uptime-checks&#34;&gt;Google Cloud Monitoring&lt;/a&gt;のUptime Checksを利用することで有効期限の監視とSlack通知を実装できます。&lt;/p&gt;
+&lt;p&gt;しかし、2022年10月から&lt;a href=&#34;https://cloud.google.com/blog/products/infrastructure/updates-to-google-clouds-infrastructure-pricing?hl=en&#34;&gt;Google Cloud MonitoringのUptime Checksは有料化&lt;/a&gt;され、&lt;a href=&#34;https://qiita.com/Saino/items/a51c2f6e1cebf3179a1a&#34;&gt;5エンドポイント以降では、1エンドポイントあたり約80USD/月&lt;/a&gt;課金されるようになりました。
+そのため、複数のエンドポイントに対して有効期限を監視する場合は高額な料金がかかるようになりました。私は数十のエンドポイントを監視する必要があったため、代替ソリューションを検討する必要がありました。&lt;/p&gt;
+&lt;h1 id=&#34;要件&#34;&gt;要件&lt;/h1&gt;
+&lt;p&gt;まず、新規に利用する監視ツールを増やしたくありませんでした。既にCloud Monitoringを利用して監視を行っているためです。闇雲にツールを増やすと、それを維持するコストがかかってしまいます。小規模な開発組織かつインフラを専属に見ているようなエンジニアが存在しないケースにおいて、なるべく利用するツールを絞ることは、オンボーディングやコミュニケーションコストを低く保つために重要です。&lt;/p&gt;
+&lt;p&gt;また、チェッカー自体がメンテンスレスで動作し続けてほしいという要求もありました。チェッカーが動作しなかったことにより、SSL/TLS証明書の有効期限切れに気づけないという問題を避けたかったためです。&lt;/p&gt;
+&lt;p&gt;さらに、なるべくイニシャルコスト・ランニングコストどちらも小さくしたいという要求もありました。&lt;/p&gt;
+&lt;h1 id=&#34;実装&#34;&gt;実装&lt;/h1&gt;
+&lt;p&gt;上記の要件を満たすために、ここではCloud Functionsを用いてSSL/TLS証明書の有効期限の検出ロジックを実装しました。検出ロジックでは、SSL/TLS証明書をフェッチし、残り期限が7日以下であればSlack通知をするようにします。&lt;/p&gt;
+&lt;p&gt;また、Cloud Schedulerを利用して、毎日当該のFunctionsを起動するように構成しました。また、Cloud Schedulerでは再試行の構成を行うことができます。Functionsが失敗した場合に備えて再試行の構成を行うことでチェッカーの動作率を上げるようにしました。&lt;/p&gt;
+&lt;h2 id=&#34;functions-実装コード&#34;&gt;Functions 実装コード&lt;/h2&gt;
+&lt;p&gt;以下が検出ロジックの実装です。
+環境変数 &lt;code&gt;SLACK_TOKEN&lt;/code&gt;, &lt;code&gt;SLACK_CHANNEL_ID&lt;/code&gt;を設定する必要があります。また、監視対象のドメインを変更する必要があります。（ここでは&lt;code&gt;api.arg.vc&lt;/code&gt;がハードコードされています）&lt;/p&gt;
+&lt;div class=&#34;highlight&#34;&gt;&lt;pre tabindex=&#34;0&#34; class=&#34;chroma&#34;&gt;&lt;code class=&#34;language-go&#34; data-lang=&#34;go&#34;&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;&lt;span class=&#34;kn&#34;&gt;package&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;checkcertificate&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;&lt;span class=&#34;kn&#34;&gt;import&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;s&#34;&gt;&amp;#34;context&amp;#34;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;s&#34;&gt;&amp;#34;crypto/tls&amp;#34;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;s&#34;&gt;&amp;#34;fmt&amp;#34;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;s&#34;&gt;&amp;#34;net/http&amp;#34;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;s&#34;&gt;&amp;#34;os&amp;#34;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;s&#34;&gt;&amp;#34;time&amp;#34;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;s&#34;&gt;&amp;#34;github.com/GoogleCloudPlatform/functions-framework-go/functions&amp;#34;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;s&#34;&gt;&amp;#34;github.com/slack-go/slack&amp;#34;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;&lt;span class=&#34;kd&#34;&gt;var&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;JST&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;=&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;time&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;FixedZone&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;s&#34;&gt;&amp;#34;Asia/tokyo&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;mi&#34;&gt;9&lt;/span&gt;&lt;span class=&#34;o&#34;&gt;*&lt;/span&gt;&lt;span class=&#34;mi&#34;&gt;60&lt;/span&gt;&lt;span class=&#34;o&#34;&gt;*&lt;/span&gt;&lt;span class=&#34;mi&#34;&gt;60&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;&lt;span class=&#34;kd&#34;&gt;func&lt;/span&gt; &lt;span class=&#34;nf&#34;&gt;init&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;()&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;nx&#34;&gt;functions&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;HTTP&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;s&#34;&gt;&amp;#34;CheckCertificates&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;CheckCertificates&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;&lt;span class=&#34;p&#34;&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;&lt;span class=&#34;kd&#34;&gt;func&lt;/span&gt; &lt;span class=&#34;nf&#34;&gt;CheckCertificates&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;w&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;http&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;ResponseWriter&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;r&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;*&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;http&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;Request&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;k&#34;&gt;if&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;:=&lt;/span&gt; &lt;span class=&#34;nf&#34;&gt;checkCertificates&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;r&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;Context&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;());&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;!=&lt;/span&gt; &lt;span class=&#34;kc&#34;&gt;nil&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;		&lt;span class=&#34;nx&#34;&gt;w&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;WriteHeader&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;http&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;StatusInternalServerError&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;		&lt;span class=&#34;nx&#34;&gt;fmt&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;Fprintf&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;w&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;s&#34;&gt;&amp;#34;checkCertificates failed: %+v&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;		&lt;span class=&#34;k&#34;&gt;return&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;p&#34;&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;nx&#34;&gt;w&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;WriteHeader&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;http&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;StatusOK&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;nx&#34;&gt;fmt&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;Fprintf&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;w&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;s&#34;&gt;&amp;#34;ok&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;&lt;span class=&#34;p&#34;&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;&lt;span class=&#34;kd&#34;&gt;func&lt;/span&gt; &lt;span class=&#34;nf&#34;&gt;getExpiration&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;domain&lt;/span&gt; &lt;span class=&#34;kt&#34;&gt;string&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;time&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;Time&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;kt&#34;&gt;error&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;nx&#34;&gt;conn&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;:=&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;tls&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;Dial&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;s&#34;&gt;&amp;#34;tcp&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;fmt&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;Sprintf&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;s&#34;&gt;&amp;#34;%s:443&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;domain&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;),&lt;/span&gt; &lt;span class=&#34;kc&#34;&gt;nil&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;k&#34;&gt;if&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;!=&lt;/span&gt; &lt;span class=&#34;kc&#34;&gt;nil&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;		&lt;span class=&#34;k&#34;&gt;return&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;time&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;Time&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;{},&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;fmt&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;Errorf&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;s&#34;&gt;&amp;#34;tls.Dial failed: %w&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;p&#34;&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;=&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;conn&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;VerifyHostname&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;domain&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;k&#34;&gt;if&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;!=&lt;/span&gt; &lt;span class=&#34;kc&#34;&gt;nil&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;		&lt;span class=&#34;k&#34;&gt;return&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;time&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;Time&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;{},&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;fmt&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;Errorf&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;s&#34;&gt;&amp;#34;VerifyHostname failed: %w&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;p&#34;&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;k&#34;&gt;return&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;conn&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;ConnectionState&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;().&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;PeerCertificates&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;[&lt;/span&gt;&lt;span class=&#34;mi&#34;&gt;0&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;].&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;NotAfter&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;kc&#34;&gt;nil&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;&lt;span class=&#34;p&#34;&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;&lt;span class=&#34;kd&#34;&gt;func&lt;/span&gt; &lt;span class=&#34;nf&#34;&gt;checkCertificates&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;ctx&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;context&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;Context&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt; &lt;span class=&#34;kt&#34;&gt;error&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;nx&#34;&gt;slackClient&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;:=&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;slack&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;New&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;os&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;Getenv&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;s&#34;&gt;&amp;#34;SLACK_TOKEN&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;))&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;nx&#34;&gt;domains&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;:=&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;[]&lt;/span&gt;&lt;span class=&#34;kt&#34;&gt;string&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;		&lt;span class=&#34;s&#34;&gt;&amp;#34;api.arg.vc&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;p&#34;&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;nx&#34;&gt;delta&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;:=&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;time&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;Now&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;().&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;AddDate&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;mi&#34;&gt;0&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;mi&#34;&gt;0&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;mi&#34;&gt;7&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;k&#34;&gt;for&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;_&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;domain&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;:=&lt;/span&gt; &lt;span class=&#34;k&#34;&gt;range&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;domains&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;		&lt;span class=&#34;nx&#34;&gt;expiration&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;:=&lt;/span&gt; &lt;span class=&#34;nf&#34;&gt;getExpiration&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;domain&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;		&lt;span class=&#34;k&#34;&gt;if&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;!=&lt;/span&gt; &lt;span class=&#34;kc&#34;&gt;nil&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;			&lt;span class=&#34;k&#34;&gt;return&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;		&lt;span class=&#34;p&#34;&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;		&lt;span class=&#34;k&#34;&gt;if&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;delta&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;UnixNano&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;()&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;&amp;gt;=&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;expiration&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;UnixNano&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;()&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;			&lt;span class=&#34;nx&#34;&gt;_&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;_&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;:=&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;slackClient&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;PostMessageContext&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;ctx&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;				&lt;span class=&#34;nx&#34;&gt;os&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;Getenv&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;s&#34;&gt;&amp;#34;SLACK_CHANNEL_ID&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;),&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;				&lt;span class=&#34;nx&#34;&gt;slack&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;MsgOptionAttachments&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;slack&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;Attachment&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;					&lt;span class=&#34;nx&#34;&gt;Title&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;:&lt;/span&gt; &lt;span class=&#34;s&#34;&gt;&amp;#34;あと7日間で証明書が切れるドメインがあります&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;					&lt;span class=&#34;nx&#34;&gt;Text&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;:&lt;/span&gt;  &lt;span class=&#34;s&#34;&gt;&amp;#34;証明書を更新してください。&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;					&lt;span class=&#34;nx&#34;&gt;Fields&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;:&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;[]&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;slack&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;AttachmentField&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;						&lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;							&lt;span class=&#34;nx&#34;&gt;Title&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;:&lt;/span&gt; &lt;span class=&#34;s&#34;&gt;&amp;#34;ドメイン名&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;							&lt;span class=&#34;nx&#34;&gt;Value&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;:&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;domain&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;						&lt;span class=&#34;p&#34;&gt;},&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;						&lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;							&lt;span class=&#34;nx&#34;&gt;Title&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;:&lt;/span&gt; &lt;span class=&#34;s&#34;&gt;&amp;#34;有効期限&amp;#34;&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;,&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;							&lt;span class=&#34;nx&#34;&gt;Value&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;:&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;expiration&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;In&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;JST&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;).&lt;/span&gt;&lt;span class=&#34;nf&#34;&gt;Format&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;(&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;time&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;.&lt;/span&gt;&lt;span class=&#34;nx&#34;&gt;RFC3339&lt;/span&gt;&lt;span class=&#34;p&#34;&gt;),&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;						&lt;span class=&#34;p&#34;&gt;},&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;					&lt;span class=&#34;p&#34;&gt;},&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;				&lt;span class=&#34;p&#34;&gt;}))&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;			&lt;span class=&#34;k&#34;&gt;if&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt; &lt;span class=&#34;o&#34;&gt;!=&lt;/span&gt; &lt;span class=&#34;kc&#34;&gt;nil&lt;/span&gt; &lt;span class=&#34;p&#34;&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;				&lt;span class=&#34;k&#34;&gt;return&lt;/span&gt; &lt;span class=&#34;nx&#34;&gt;err&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;			&lt;span class=&#34;p&#34;&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;		&lt;span class=&#34;p&#34;&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;p&#34;&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;	&lt;span class=&#34;k&#34;&gt;return&lt;/span&gt; &lt;span class=&#34;kc&#34;&gt;nil&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class=&#34;line&#34;&gt;&lt;span class=&#34;cl&#34;&gt;&lt;span class=&#34;p&#34;&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;h1 id=&#34;評価&#34;&gt;評価&lt;/h1&gt;
+&lt;p&gt;まず、イニシャルコストの観点では、1時間かからずに作り終えることができました。SSL/TLS証明書の有効期限の取得はとても簡単に行うことができるためです。上記ソースコードの&lt;code&gt;getExpiration&lt;/code&gt;関数を見ていただければわかる通り、Go言語では5行以内で取得処理を実装することができます。
+これは嬉しい誤算でした。このプロジェクトを始める前、私は有効期限の取得のためにバイナリをパーズする等の複雑なコードを書かなければいけないのでは、と考えていましたが、実際にはGo言語の標準APIを呼び出すだけで済みました。
+また、Cloud SchedulerやCloud Functionsの利用には初期料金はかからないため、イニシャルコストは実装工数のみでした。&lt;/p&gt;
+&lt;p&gt;次に、ランニングコストの観点では、トータルで0.2USD/月以下に抑えることができました。これは、無視できる程度の費用ではないかと考えます。
+また、無料枠に収まっているため、他にCloud SchedulerやCloud Functionsを利用していなければ無料で維持することが可能です。詳細な費用の内訳は以下になります。&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;Cloud Schedulerの料金
+&lt;ul&gt;
+&lt;li&gt;&lt;a href=&#34;https://cloud.google.com/scheduler/pricing?hl=ja&#34;&gt;ジョブあたり0.10USD/月&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;li&gt;Cloud Functionsの料金
+&lt;ul&gt;
+&lt;li&gt;&lt;a href=&#34;https://cloud.google.com/functions/pricing&#34;&gt;呼び出しあたり0.0000004USD/回&lt;/a&gt;
+&lt;ul&gt;
+&lt;li&gt;リトライなしで計算すると毎日実行であるため31回。毎回3回のリトライが発生したとしても100回以下。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;li&gt;&lt;a href=&#34;https://cloud.google.com/functions/pricing#:~:text=%E3%81%94%E8%A6%A7%E3%81%8F%E3%81%A0%E3%81%95%E3%81%84%E3%80%82-,%E3%82%B3%E3%83%B3%E3%83%94%E3%83%A5%E3%83%BC%E3%83%86%E3%82%A3%E3%83%B3%E3%82%B0%E6%99%82%E9%96%93,-%E3%82%B3%E3%83%B3%E3%83%94%E3%83%A5&#34;&gt;コンピューティング時間 128 MB/.083 vCPU構成において、0.000000231USD/100ms&lt;/a&gt;
+&lt;ul&gt;
+&lt;li&gt;1回エンドポイントの場合で avg 100ms ほど。よって、単に呼び出し回数を乗ずればよい。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h1 id=&#34;結論&#34;&gt;結論&lt;/h1&gt;
+&lt;p&gt;利用する監視ツールを最低限に抑えるために、SSL/TLS証明書の有効期限の監視を自分で実装するという選択肢も有効であると思いました。
+Google Cloud MonitoringのUptime Checksの移行先にお困りの方は採用してみてはいかがでしょうか。&lt;/p&gt;
+</description>
+    </item>
+    
+    
+  </channel>
+</rss>

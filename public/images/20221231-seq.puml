@@ -1,0 +1,48 @@
+
+@startuml
+
+autonumber
+actor user as user
+
+participant "API Handler" as api
+
+database "database" as db
+
+participant "Enqueue Worker" as worker
+
+participant "Cloud Tasks" as tasks
+
+activate worker
+
+user -> api ++: APIをコール
+
+api -> db: リアルタイムに更新するべき情報を更新
+api -> db: ステータス=未処理でタスク作成依頼レコードを挿入
+return
+
+
+loop 100msでポーリング
+worker -> db: ステータス=未処理のタスク作成依頼レコードをフェッチ
+
+loop タスク作成依頼レコードごとに
+
+worker -> tasks: Cloud Tasksのタスクをエンキュー
+opt Already Exists
+note over worker #pink
+Cloud Tasksはタスクの重複作成を防止する機能がある
+重複が発生した場合はAlready Existsエラーが返却される
+タスク作成レコードの主キーを重複防止キーと設定しておき、エラーが起きたら無視する
+end note
+worker -> worker: 無視する
+end opt
+worker -> db: ステータスを処理済みに更新
+
+
+end loop
+
+end loop
+
+
+
+
+@enduml

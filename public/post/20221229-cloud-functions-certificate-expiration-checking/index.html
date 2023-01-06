@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <link rel="shortcut icon" href="https://blog.arg.vc/favicon.ico">
+    
+    <link rel="stylesheet" href="/css/style.min.css">
+
+    <link rel="canonical" href="https://blog.arg.vc/post/20221229-cloud-functions-certificate-expiration-checking/" />
+    <title>Cloud FunctionsでSSL/TLS証明書の有効期限チェッカーを実装する</title>
+</head>
+<script type="module">
+    
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/9.15.0/firebase-app.js";
+    import { getAnalytics } from "https://www.gstatic.com/firebasejs/9.15.0/firebase-analytics.js";
+    
+    
+
+    
+    
+    const firebaseConfig = {
+        apiKey: "AIzaSyB_ByM3Trn6tgTjlyk7PczUodi51xhQe6s",
+        authDomain: "arg-vc.firebaseapp.com",
+        projectId: "arg-vc",
+        storageBucket: "arg-vc.appspot.com",
+        messagingSenderId: "44903873603",
+        appId: "1:44903873603:web:54ff57613c76385078e8f6",
+        measurementId: "G-ZCBT6HD1G8"
+    };
+
+    
+    const app = initializeApp(firebaseConfig);
+    const analytics = getAnalytics(app);
+</script><body><header id="banner">
+    <h2><a href="https://blog.arg.vc/">blog.arg.vc</a></h2>
+    <nav>
+        <ul>
+            <li>
+                <a href="/" title="posts">posts</a>
+            </li>
+        </ul>
+    </nav>
+</header>
+<main id="content">
+<article>
+    <header id="post-header">
+        <h1>Cloud FunctionsでSSL/TLS証明書の有効期限チェッカーを実装する</h1>
+        <div>
+                <time>December 29, 2022</time>
+            </div>
+    </header><h1 id="背景">背景</h1>
+<p>現代でもLet&rsquo;s encryptが利用できないような環境においては、SSL/TLS証明書の手動更新を実施する必要があります。
+このようなSSL/TLS証明書の有効期限の管理は煩雑で忘れがちです。そのため、有効期限が近くなった場合にSlackなどに通知するシステムを利用することはよくあると思います。
+著名なところでは、<a href="https://ja.mackerel.io/">Mackerel</a>や<a href="https://cloud.google.com/monitoring/uptime-checks">Google Cloud Monitoring</a>のUptime Checksを利用することで有効期限の監視とSlack通知を実装できます。</p>
+<p>しかし、2022年10月から<a href="https://cloud.google.com/blog/products/infrastructure/updates-to-google-clouds-infrastructure-pricing?hl=en">Google Cloud MonitoringのUptime Checksは有料化</a>され、<a href="https://qiita.com/Saino/items/a51c2f6e1cebf3179a1a">5エンドポイント以降では、1エンドポイントあたり約80USD/月</a>課金されるようになりました。
+そのため、複数のエンドポイントに対して有効期限を監視する場合は高額な料金がかかるようになりました。私は数十のエンドポイントを監視する必要があったため、代替ソリューションを検討する必要がありました。</p>
+<h1 id="要件">要件</h1>
+<p>まず、新規に利用する監視ツールを増やしたくありませんでした。既にCloud Monitoringを利用して監視を行っているためです。闇雲にツールを増やすと、それを維持するコストがかかってしまいます。小規模な開発組織かつインフラを専属に見ているようなエンジニアが存在しないケースにおいて、なるべく利用するツールを絞ることは、オンボーディングやコミュニケーションコストを低く保つために重要です。</p>
+<p>また、チェッカー自体がメンテンスレスで動作し続けてほしいという要求もありました。チェッカーが動作しなかったことにより、SSL/TLS証明書の有効期限切れに気づけないという問題を避けたかったためです。</p>
+<p>さらに、なるべくイニシャルコスト・ランニングコストどちらも小さくしたいという要求もありました。</p>
+<h1 id="実装">実装</h1>
+<p>上記の要件を満たすために、ここではCloud Functionsを用いてSSL/TLS証明書の有効期限の検出ロジックを実装しました。検出ロジックでは、SSL/TLS証明書をフェッチし、残り期限が7日以下であればSlack通知をするようにします。</p>
+<p>また、Cloud Schedulerを利用して、毎日当該のFunctionsを起動するように構成しました。また、Cloud Schedulerでは再試行の構成を行うことができます。Functionsが失敗した場合に備えて再試行の構成を行うことでチェッカーの動作率を上げるようにしました。</p>
+<h2 id="functions-実装コード">Functions 実装コード</h2>
+<p>以下が検出ロジックの実装です。
+環境変数 <code>SLACK_TOKEN</code>, <code>SLACK_CHANNEL_ID</code>を設定する必要があります。また、監視対象のドメインを変更する必要があります。（ここでは<code>api.arg.vc</code>がハードコードされています）</p>
+<div class="highlight"><pre tabindex="0" class="chroma"><code class="language-go" data-lang="go"><span class="line"><span class="cl"><span class="kn">package</span> <span class="nx">checkcertificate</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl"><span class="kn">import</span> <span class="p">(</span>
+</span></span><span class="line"><span class="cl">	<span class="s">&#34;context&#34;</span>
+</span></span><span class="line"><span class="cl">	<span class="s">&#34;crypto/tls&#34;</span>
+</span></span><span class="line"><span class="cl">	<span class="s">&#34;fmt&#34;</span>
+</span></span><span class="line"><span class="cl">	<span class="s">&#34;net/http&#34;</span>
+</span></span><span class="line"><span class="cl">	<span class="s">&#34;os&#34;</span>
+</span></span><span class="line"><span class="cl">	<span class="s">&#34;time&#34;</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">	<span class="s">&#34;github.com/GoogleCloudPlatform/functions-framework-go/functions&#34;</span>
+</span></span><span class="line"><span class="cl">	<span class="s">&#34;github.com/slack-go/slack&#34;</span>
+</span></span><span class="line"><span class="cl"><span class="p">)</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl"><span class="kd">var</span> <span class="nx">JST</span> <span class="p">=</span> <span class="nx">time</span><span class="p">.</span><span class="nf">FixedZone</span><span class="p">(</span><span class="s">&#34;Asia/tokyo&#34;</span><span class="p">,</span> <span class="mi">9</span><span class="o">*</span><span class="mi">60</span><span class="o">*</span><span class="mi">60</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl"><span class="kd">func</span> <span class="nf">init</span><span class="p">()</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">	<span class="nx">functions</span><span class="p">.</span><span class="nf">HTTP</span><span class="p">(</span><span class="s">&#34;CheckCertificates&#34;</span><span class="p">,</span> <span class="nx">CheckCertificates</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="p">}</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl"><span class="kd">func</span> <span class="nf">CheckCertificates</span><span class="p">(</span><span class="nx">w</span> <span class="nx">http</span><span class="p">.</span><span class="nx">ResponseWriter</span><span class="p">,</span> <span class="nx">r</span> <span class="o">*</span><span class="nx">http</span><span class="p">.</span><span class="nx">Request</span><span class="p">)</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">	<span class="k">if</span> <span class="nx">err</span> <span class="o">:=</span> <span class="nf">checkCertificates</span><span class="p">(</span><span class="nx">r</span><span class="p">.</span><span class="nf">Context</span><span class="p">());</span> <span class="nx">err</span> <span class="o">!=</span> <span class="kc">nil</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">		<span class="nx">w</span><span class="p">.</span><span class="nf">WriteHeader</span><span class="p">(</span><span class="nx">http</span><span class="p">.</span><span class="nx">StatusInternalServerError</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl">		<span class="nx">fmt</span><span class="p">.</span><span class="nf">Fprintf</span><span class="p">(</span><span class="nx">w</span><span class="p">,</span> <span class="s">&#34;checkCertificates failed: %+v&#34;</span><span class="p">,</span> <span class="nx">err</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl">		<span class="k">return</span>
+</span></span><span class="line"><span class="cl">	<span class="p">}</span>
+</span></span><span class="line"><span class="cl">	<span class="nx">w</span><span class="p">.</span><span class="nf">WriteHeader</span><span class="p">(</span><span class="nx">http</span><span class="p">.</span><span class="nx">StatusOK</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl">	<span class="nx">fmt</span><span class="p">.</span><span class="nf">Fprintf</span><span class="p">(</span><span class="nx">w</span><span class="p">,</span> <span class="s">&#34;ok&#34;</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="p">}</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl"><span class="kd">func</span> <span class="nf">getExpiration</span><span class="p">(</span><span class="nx">domain</span> <span class="kt">string</span><span class="p">)</span> <span class="p">(</span><span class="nx">time</span><span class="p">.</span><span class="nx">Time</span><span class="p">,</span> <span class="kt">error</span><span class="p">)</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">	<span class="nx">conn</span><span class="p">,</span> <span class="nx">err</span> <span class="o">:=</span> <span class="nx">tls</span><span class="p">.</span><span class="nf">Dial</span><span class="p">(</span><span class="s">&#34;tcp&#34;</span><span class="p">,</span> <span class="nx">fmt</span><span class="p">.</span><span class="nf">Sprintf</span><span class="p">(</span><span class="s">&#34;%s:443&#34;</span><span class="p">,</span> <span class="nx">domain</span><span class="p">),</span> <span class="kc">nil</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl">	<span class="k">if</span> <span class="nx">err</span> <span class="o">!=</span> <span class="kc">nil</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">		<span class="k">return</span> <span class="nx">time</span><span class="p">.</span><span class="nx">Time</span><span class="p">{},</span> <span class="nx">fmt</span><span class="p">.</span><span class="nf">Errorf</span><span class="p">(</span><span class="s">&#34;tls.Dial failed: %w&#34;</span><span class="p">,</span> <span class="nx">err</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl">	<span class="p">}</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">	<span class="nx">err</span> <span class="p">=</span> <span class="nx">conn</span><span class="p">.</span><span class="nf">VerifyHostname</span><span class="p">(</span><span class="nx">domain</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl">	<span class="k">if</span> <span class="nx">err</span> <span class="o">!=</span> <span class="kc">nil</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">		<span class="k">return</span> <span class="nx">time</span><span class="p">.</span><span class="nx">Time</span><span class="p">{},</span> <span class="nx">fmt</span><span class="p">.</span><span class="nf">Errorf</span><span class="p">(</span><span class="s">&#34;VerifyHostname failed: %w&#34;</span><span class="p">,</span> <span class="nx">err</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl">	<span class="p">}</span>
+</span></span><span class="line"><span class="cl">	<span class="k">return</span> <span class="nx">conn</span><span class="p">.</span><span class="nf">ConnectionState</span><span class="p">().</span><span class="nx">PeerCertificates</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="nx">NotAfter</span><span class="p">,</span> <span class="kc">nil</span>
+</span></span><span class="line"><span class="cl"><span class="p">}</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl"><span class="kd">func</span> <span class="nf">checkCertificates</span><span class="p">(</span><span class="nx">ctx</span> <span class="nx">context</span><span class="p">.</span><span class="nx">Context</span><span class="p">)</span> <span class="kt">error</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">	<span class="nx">slackClient</span> <span class="o">:=</span> <span class="nx">slack</span><span class="p">.</span><span class="nf">New</span><span class="p">(</span><span class="nx">os</span><span class="p">.</span><span class="nf">Getenv</span><span class="p">(</span><span class="s">&#34;SLACK_TOKEN&#34;</span><span class="p">))</span>
+</span></span><span class="line"><span class="cl">	<span class="nx">domains</span> <span class="o">:=</span> <span class="p">[]</span><span class="kt">string</span><span class="p">{</span>
+</span></span><span class="line"><span class="cl">		<span class="s">&#34;api.arg.vc&#34;</span><span class="p">,</span>
+</span></span><span class="line"><span class="cl">	<span class="p">}</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">	<span class="nx">delta</span> <span class="o">:=</span> <span class="nx">time</span><span class="p">.</span><span class="nf">Now</span><span class="p">().</span><span class="nf">AddDate</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">7</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">	<span class="k">for</span> <span class="nx">_</span><span class="p">,</span> <span class="nx">domain</span> <span class="o">:=</span> <span class="k">range</span> <span class="nx">domains</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">		<span class="nx">expiration</span><span class="p">,</span> <span class="nx">err</span> <span class="o">:=</span> <span class="nf">getExpiration</span><span class="p">(</span><span class="nx">domain</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl">		<span class="k">if</span> <span class="nx">err</span> <span class="o">!=</span> <span class="kc">nil</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">			<span class="k">return</span> <span class="nx">err</span>
+</span></span><span class="line"><span class="cl">		<span class="p">}</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">		<span class="k">if</span> <span class="nx">delta</span><span class="p">.</span><span class="nf">UnixNano</span><span class="p">()</span> <span class="o">&gt;=</span> <span class="nx">expiration</span><span class="p">.</span><span class="nf">UnixNano</span><span class="p">()</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">			<span class="nx">_</span><span class="p">,</span> <span class="nx">_</span><span class="p">,</span> <span class="nx">err</span> <span class="o">:=</span> <span class="nx">slackClient</span><span class="p">.</span><span class="nf">PostMessageContext</span><span class="p">(</span><span class="nx">ctx</span><span class="p">,</span>
+</span></span><span class="line"><span class="cl">				<span class="nx">os</span><span class="p">.</span><span class="nf">Getenv</span><span class="p">(</span><span class="s">&#34;SLACK_CHANNEL_ID&#34;</span><span class="p">),</span>
+</span></span><span class="line"><span class="cl">				<span class="nx">slack</span><span class="p">.</span><span class="nf">MsgOptionAttachments</span><span class="p">(</span><span class="nx">slack</span><span class="p">.</span><span class="nx">Attachment</span><span class="p">{</span>
+</span></span><span class="line"><span class="cl">					<span class="nx">Title</span><span class="p">:</span> <span class="s">&#34;あと7日間で証明書が切れるドメインがあります&#34;</span><span class="p">,</span>
+</span></span><span class="line"><span class="cl">					<span class="nx">Text</span><span class="p">:</span>  <span class="s">&#34;証明書を更新してください。&#34;</span><span class="p">,</span>
+</span></span><span class="line"><span class="cl">					<span class="nx">Fields</span><span class="p">:</span> <span class="p">[]</span><span class="nx">slack</span><span class="p">.</span><span class="nx">AttachmentField</span><span class="p">{</span>
+</span></span><span class="line"><span class="cl">						<span class="p">{</span>
+</span></span><span class="line"><span class="cl">							<span class="nx">Title</span><span class="p">:</span> <span class="s">&#34;ドメイン名&#34;</span><span class="p">,</span>
+</span></span><span class="line"><span class="cl">							<span class="nx">Value</span><span class="p">:</span> <span class="nx">domain</span><span class="p">,</span>
+</span></span><span class="line"><span class="cl">						<span class="p">},</span>
+</span></span><span class="line"><span class="cl">						<span class="p">{</span>
+</span></span><span class="line"><span class="cl">							<span class="nx">Title</span><span class="p">:</span> <span class="s">&#34;有効期限&#34;</span><span class="p">,</span>
+</span></span><span class="line"><span class="cl">							<span class="nx">Value</span><span class="p">:</span> <span class="nx">expiration</span><span class="p">.</span><span class="nf">In</span><span class="p">(</span><span class="nx">JST</span><span class="p">).</span><span class="nf">Format</span><span class="p">(</span><span class="nx">time</span><span class="p">.</span><span class="nx">RFC3339</span><span class="p">),</span>
+</span></span><span class="line"><span class="cl">						<span class="p">},</span>
+</span></span><span class="line"><span class="cl">					<span class="p">},</span>
+</span></span><span class="line"><span class="cl">				<span class="p">}))</span>
+</span></span><span class="line"><span class="cl">			<span class="k">if</span> <span class="nx">err</span> <span class="o">!=</span> <span class="kc">nil</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">				<span class="k">return</span> <span class="nx">err</span>
+</span></span><span class="line"><span class="cl">			<span class="p">}</span>
+</span></span><span class="line"><span class="cl">		<span class="p">}</span>
+</span></span><span class="line"><span class="cl">	<span class="p">}</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">	<span class="k">return</span> <span class="kc">nil</span>
+</span></span><span class="line"><span class="cl"><span class="p">}</span>
+</span></span></code></pre></div><h1 id="評価">評価</h1>
+<p>まず、イニシャルコストの観点では、1時間かからずに作り終えることができました。SSL/TLS証明書の有効期限の取得はとても簡単に行うことができるためです。上記ソースコードの<code>getExpiration</code>関数を見ていただければわかる通り、Go言語では5行以内で取得処理を実装することができます。
+これは嬉しい誤算でした。このプロジェクトを始める前、私は有効期限の取得のためにバイナリをパーズする等の複雑なコードを書かなければいけないのでは、と考えていましたが、実際にはGo言語の標準APIを呼び出すだけで済みました。
+また、Cloud SchedulerやCloud Functionsの利用には初期料金はかからないため、イニシャルコストは実装工数のみでした。</p>
+<p>次に、ランニングコストの観点では、トータルで0.2USD/月以下に抑えることができました。これは、無視できる程度の費用ではないかと考えます。
+また、無料枠に収まっているため、他にCloud SchedulerやCloud Functionsを利用していなければ無料で維持することが可能です。詳細な費用の内訳は以下になります。</p>
+<ul>
+<li>Cloud Schedulerの料金
+<ul>
+<li><a href="https://cloud.google.com/scheduler/pricing?hl=ja">ジョブあたり0.10USD/月</a></li>
+</ul>
+</li>
+<li>Cloud Functionsの料金
+<ul>
+<li><a href="https://cloud.google.com/functions/pricing">呼び出しあたり0.0000004USD/回</a>
+<ul>
+<li>リトライなしで計算すると毎日実行であるため31回。毎回3回のリトライが発生したとしても100回以下。</li>
+</ul>
+</li>
+<li><a href="https://cloud.google.com/functions/pricing#:~:text=%E3%81%94%E8%A6%A7%E3%81%8F%E3%81%A0%E3%81%95%E3%81%84%E3%80%82-,%E3%82%B3%E3%83%B3%E3%83%94%E3%83%A5%E3%83%BC%E3%83%86%E3%82%A3%E3%83%B3%E3%82%B0%E6%99%82%E9%96%93,-%E3%82%B3%E3%83%B3%E3%83%94%E3%83%A5">コンピューティング時間 128 MB/.083 vCPU構成において、0.000000231USD/100ms</a>
+<ul>
+<li>1回エンドポイントの場合で avg 100ms ほど。よって、単に呼び出し回数を乗ずればよい。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h1 id="結論">結論</h1>
+<p>利用する監視ツールを最低限に抑えるために、SSL/TLS証明書の有効期限の監視を自分で実装するという選択肢も有効であると思いました。
+Google Cloud MonitoringのUptime Checksの移行先にお困りの方は採用してみてはいかがでしょうか。</p>
+</article>
+
+        </main><footer id="footer">
+    Copyright © 2022-2023 arg.vc
+</footer>
+</body>
+</html>

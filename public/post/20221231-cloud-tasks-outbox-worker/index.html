@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <link rel="shortcut icon" href="https://blog.arg.vc/favicon.ico">
+    
+    <link rel="stylesheet" href="/css/style.min.css">
+
+    <link rel="canonical" href="https://blog.arg.vc/post/20221231-cloud-tasks-outbox-worker/" />
+    <title>Cloud Tasks向けのTransactional Outboxワーカーを実装する</title>
+</head>
+<script type="module">
+    
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/9.15.0/firebase-app.js";
+    import { getAnalytics } from "https://www.gstatic.com/firebasejs/9.15.0/firebase-analytics.js";
+    
+    
+
+    
+    
+    const firebaseConfig = {
+        apiKey: "AIzaSyB_ByM3Trn6tgTjlyk7PczUodi51xhQe6s",
+        authDomain: "arg-vc.firebaseapp.com",
+        projectId: "arg-vc",
+        storageBucket: "arg-vc.appspot.com",
+        messagingSenderId: "44903873603",
+        appId: "1:44903873603:web:54ff57613c76385078e8f6",
+        measurementId: "G-ZCBT6HD1G8"
+    };
+
+    
+    const app = initializeApp(firebaseConfig);
+    const analytics = getAnalytics(app);
+</script><body><header id="banner">
+    <h2><a href="https://blog.arg.vc/">blog.arg.vc</a></h2>
+    <nav>
+        <ul>
+            <li>
+                <a href="/" title="posts">posts</a>
+            </li>
+        </ul>
+    </nav>
+</header>
+<main id="content">
+<article>
+    <header id="post-header">
+        <h1>Cloud Tasks向けのTransactional Outboxワーカーを実装する</h1>
+        <div>
+                <time>December 31, 2022</time>
+            </div>
+    </header><h1 id="背景">背景</h1>
+<p>現代的なデータベース駆動アプリケーションでは、メインとなるデータベースに加えて、Web API等を利用して他のシステムと連携することが避けられません。
+例えば、外部決済システムと接続することを考えると、まず決済をAPI経由等で実行した上で、その結果に応じてデータベースの更新を行う必要があります。</p>
+<p>このような場合に発生する典型的な懸念として、メインデータベースと外部システムのリソース間の不整合があります。
+外部システムのリソース更新とメインデータベースのトランザクションコミットのどちらか片方が失敗するケースが考えられるからです。
+例えば、先程の決済システムの例では、決済が成功したがデータベースのコミットに失敗した場合が考えられます。
+このケースでは、ユーザーの残高は引き落とされているがアプリケーションとしてはそれを認識していない（＝未決済状態）という過払いの状態になるため、問題です。</p>
+<p>このようなリソース不整合問題に対して、トランザクションマネージャやSaga, TCCパターンなどのさまざまな解決策が知られています。
+その中の1つの手軽な解決策として、冪等キー等を用いてロジック全体をリトライ可能にした上で、無限リトライを実施するという方法が存在します。
+しかし、データベース駆動アプリケーションがWeb APIの場合、無限リトライを期待することはできません。ユーザーの離脱により、リトライを実行するコンポーネントがなくなってしまうためです。</p>
+<p>このようなケースで無限リトライをトリガーできるSaaSとして、<a href="https://cloud.google.com/tasks?hl=ja">Google Cloud Tasks</a>があります。
+Cloud Tasksを利用することで、HTTPリクエストを無限リトライするキューを作ることができます。</p>
+<h2 id="課題">課題</h2>
+<p>Cloud Tasksにエンキューをするためには、<a href="https://cloud.google.com/tasks/docs/reference/rest/v2beta3/projects.locations.queues.tasks/create">TasksリソースをAPI経由で作成</a>する必要があります。
+そのため、UX都合などで、ユーザーリクエスト契機でデータベースをすぐに更新する必要がある場合、
+ユーザーリクエスト同期でデータベースを更新した上でCloud TasksのAPIをコールする必要があります。<sup id="fnref:1"><a href="#fn:1" class="footnote-ref" role="doc-noteref">1</a></sup></p>
+<p>そのため、このようなケースにおいては、データベースとCloud Tasks間のリソース整合性の検討をする必要があります。</p>
+<h2 id="実装">実装</h2>
+<p>この問題を解決するために、<a href="https://microservices.io/patterns/data/transactional-outbox.html">Transactional Outboxパターン</a>を用いてTaskエンキューを行うワーカーを作成しました。
+ざっくりいうと、タスク作成キューをデータベースに設け、そのキューを監視してCloud Tasks APIをコールする常時起動ワーカーを作成するという方法です。</p>
+<p>大まかな仕組みを説明します。
+APIハンドラはタスクエンキューのために同期的にCloud TaskのAPIを叩く代わりに、ステータス=未処理でタスク作成依頼用テーブルに1行インサートするようにします。
+常時起動ワーカーは定期的(100ms等)にステータス=未処理のタスク作成依頼用レコードを全件フェッチし、1行ごとに1TasksをCloud Tasks APIをコールしてエンキューするようにした後、ステータスを処理済みに更新します。</p>
+<figure class="center"><img src="/images/20221231-seq.png" width="1184" height="588"/><figcaption>
+            <h4>シーケンス図</h4>
+        </figcaption>
+</figure>
+
+<h2 id="評価">評価</h2>
+<p>このワーカーにより、データベース状態とTask作成のリソース整合性が担保されるようになりました。
+Taskでは無限リトライが発生するので、Task内をリトライ可能に実装することができれば、外部API呼び出しやDB更新のリソース整合性をケアできるようになりました。</p>
+<p>副次的な効果として、バックグラウンドタスクを気軽に実行できるようになりました。
+Cloud Runを使用している場合、リクエストを処理していない時間はCPUが止まってしまいます。
+そのため、リクエスト非同期のタスクを処理する仕組みが必要です。この方法はデータベースに値挿入するだけでタスクのエンキューを行うことができるため、
+リクエスト非同期のタスクを簡単にエンキューすることができるようになりました。</p>
+<p>一方で、常時起動インスタンスを利用している関係上、ランニングコストが高くなっています。現状、Cloud Runでは常時起動インスタンスを利用すると70USD/月が課金されていまいます。
+リアルタイム性がさほど重要でないシステムであれば、Taskエンキューを行うワーカーはバッチとして実装することで、インフラ費用を削減することができます。</p>
+<hr>
+<div class="footnotes" role="doc-endnotes">
+<hr>
+<ol>
+<li id="fn:1">
+<p>リアルタイム性が強く求められない場合、APIハンドラで同期的にDBを更新せずCloud Tasksにエンキューするだけで十分です。このケースでは、Taskハンドラ側でDB更新や外部リソース作成の処理を担当させます。&#160;<a href="#fnref:1" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+</ol>
+</div>
+</article>
+
+        </main><footer id="footer">
+    Copyright © 2022-2023 arg.vc
+</footer>
+</body>
+</html>

@@ -1,0 +1,28 @@
+baseURL = 'https://blog.arg.vc/'
+languageCode = 'ja-JP'
+title = 'blog.arg.vc'
+theme = "etch"
+enableInlineShortcodes = true
+pygmentsCodeFences = true
+pygmentsUseClasses = true
+
+[params]
+  copyright = "Copyright © 2022-2023 arg.vc"
+  dark = "auto"
+  highlight = true
+
+[menu]
+  [[menu.main]]
+    identifier = "posts"
+    name = "posts"
+    title = "posts"
+    url = "/"
+    weight = 10
+
+
+[permalinks]
+  posts = "/:title/"
+
+[markup.goldmark.renderer]
+  # Allows HTML in Markdown
+  unsafe = true

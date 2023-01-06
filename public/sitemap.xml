@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+  xmlns:xhtml="http://www.w3.org/1999/xhtml">
+  <url>
+    <loc>https://blog.arg.vc/</loc>
+    <lastmod>2022-12-31T00:00:00+09:00</lastmod>
+  </url><url>
+    <loc>https://blog.arg.vc/post/20221231-cloud-tasks-outbox-worker/</loc>
+    <lastmod>2022-12-31T00:00:00+09:00</lastmod>
+  </url><url>
+    <loc>https://blog.arg.vc/post/</loc>
+    <lastmod>2022-12-31T00:00:00+09:00</lastmod>
+  </url><url>
+    <loc>https://blog.arg.vc/post/20221230-cloud-endpoints-error-detail/</loc>
+    <lastmod>2022-12-30T00:00:00+09:00</lastmod>
+  </url><url>
+    <loc>https://blog.arg.vc/post/20221229-cloud-functions-certificate-expiration-checking/</loc>
+    <lastmod>2022-12-29T00:00:00+09:00</lastmod>
+  </url><url>
+    <loc>https://blog.arg.vc/categories/</loc>
+  </url><url>
+    <loc>https://blog.arg.vc/tags/</loc>
+  </url>
+</urlset>

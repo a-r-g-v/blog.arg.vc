@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <link rel="shortcut icon" href="https://blog.arg.vc/favicon.ico">
+    
+    <link rel="stylesheet" href="/css/style.min.css">
+
+    <link rel="canonical" href="https://blog.arg.vc/post/20221230-cloud-endpoints-error-detail/" />
+    <title>Cloud EndpointsでgRPCのエラー詳細をレスポンスに含める</title>
+</head>
+<script type="module">
+    
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/9.15.0/firebase-app.js";
+    import { getAnalytics } from "https://www.gstatic.com/firebasejs/9.15.0/firebase-analytics.js";
+    
+    
+
+    
+    
+    const firebaseConfig = {
+        apiKey: "AIzaSyB_ByM3Trn6tgTjlyk7PczUodi51xhQe6s",
+        authDomain: "arg-vc.firebaseapp.com",
+        projectId: "arg-vc",
+        storageBucket: "arg-vc.appspot.com",
+        messagingSenderId: "44903873603",
+        appId: "1:44903873603:web:54ff57613c76385078e8f6",
+        measurementId: "G-ZCBT6HD1G8"
+    };
+
+    
+    const app = initializeApp(firebaseConfig);
+    const analytics = getAnalytics(app);
+</script><body><header id="banner">
+    <h2><a href="https://blog.arg.vc/">blog.arg.vc</a></h2>
+    <nav>
+        <ul>
+            <li>
+                <a href="/" title="posts">posts</a>
+            </li>
+        </ul>
+    </nav>
+</header>
+<main id="content">
+<article>
+    <header id="post-header">
+        <h1>Cloud EndpointsでgRPCのエラー詳細をレスポンスに含める</h1>
+        <div>
+                <time>December 30, 2022</time>
+            </div>
+    </header><h1 id="tldr">TL;DR</h1>
+<p>Google Cloud Endpointsを利用してgRPCサーバーをHTTP JSON APIサーバーに変換する場合で、エラー表現にRicher error modelを利用するケースにおいては
+<code>google/rpc/error_details.proto</code> を proto descriptor setに含める（Protocol Buffer ファイルから import する）ことで、エラー詳細がレスポンスペイロードにJSONオブジェクトとして返却されるようになります。</p>
+<h1 id="背景">背景</h1>
+<p>Google Cloud Endpointsを利用すると、gRPCで実装されたサーバーを一般的なHTTP JSON APIサーバーに変換することができます。
+この変換は、<a href="https://github.com/GoogleCloudPlatform/esp-v2">Extensible Service Proxy V2（ESPv2）</a> と呼ばれる Envoy ベースのゲートウェイサーバーを利用して行います。
+ESPv2では、Envoy の <a href="https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/grpc_json_transcoder/v3/transcoder.proto">gRPC-JSON transcoder</a> 機能を用いて変換処理を行っています。</p>
+<p>また、一般にgRPCを利用されたサーバーでエラーを表現する場合、<a href="https://grpc.io/docs/guides/error/">「Standard error model」と「Richer error model」という2つの方法が知られています。</a>
+Standard error modelは単純な<a href="https://grpc.github.io/grpc/core/md_doc_statuscodes.html">gRPC ステータスコード</a>を利用してエラーを表現する方法です。
+Richer error modelは、事前にエラー詳細のフォーマットを規定しておき、メタデータにその情報を詰めてレスポンスすることで、ステータスコードよりも多くのエラー情報を表現することができる方法です。
+例えば、<a href="https://cloud.google.com/apis/design/errors#error_model">GoogleのAPI設計ガイドのエラー</a>では、Google APIs でのRicher error modelの適用例を知ることができます。</p>
+<h1 id="問題">問題</h1>
+<p>前述の通り、Richer error modelではエラー詳細をメタデータに詰めてレスポンスします。
+一方で、一般的なHTTP JSON APIサーバーでのエラーの表現方法は、レスポンスペイロードにエラーを表現するJSONオブジェクトを詰めて返却することです。
+よって、何も工夫せずにGoogle Cloud Endpointsを利用すると、エラー詳細はレスポンスのHTTPヘッダー <code>grpc-status-details-bin</code> に詰められて返却されていまいます。
+そのため、APIクライアントはHTTPヘッダーのエラー詳細をパーズして、エラーハンドリングを行う必要が発生してしまいます。
+<a href="https://github.com/shumbo/grpc-web-error-details">これを行うライブラリ</a>はありますが、余計な手間をAPIクライアントに押し付けることは問題です。</p>
+<p>あるべき姿は、通常のHTTP JSON APIサーバーと同様に、エラー詳細をレスポンスペイロードにJSONオブジェクトとして返却することです。</p>
+<h1 id="対処方法">対処方法</h1>
+<p>EnvoyのgRPC-JSON transcoderには<a href="https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/grpc_json_transcoder/v3/transcoder.proto">機能フラグ<code>convert_grpc_status</code></a>が存在しており、これを有効にするとHTTPヘッダー<code>grpc-status-details-bin</code>に含まれる
+エラー詳細をデコードし、レスポンスペイロードにJSONオブジェクトを詰めて返却してくれます。この機能を利用することで、問題を解消することができます。<a href="https://github.com/GoogleCloudPlatform/esp-v2/blob/6f914c6798b3239645935cfca64b61f33b6a9dab/src/go/configgenerator/filterconfig/filter_generator.go#L324">また、ESPv2ではこの機能フラグは有効になっています。</a>
+しかし、私の環境では何故かこの機能が動作していませんでした。</p>
+<p>原因は、<code>proto descriptor set</code>に <a href="https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto"><code>google/rpc/error_details.proto</code></a> を含めていないことでした。
+Envoyの公式ドキュメントには以下の記述があります。</p>
+<blockquote>
+<p>In order to transcode the message, the google.rpc.RequestInfo type from the google/rpc/error_details.proto should be included in the configured proto descriptor set.</p>
+</blockquote>
+<p>よって、このファイルを protoc を実行するプロジェクトに配置した上で、Protocol Buffer ファイルから <code>google/rpc/error_details.proto</code> を import する必要がありました。
+上記を実施することで、エラー詳細がレスポンスペイロードにJSONオブジェクトとして返却されるようになりました。</p>
+</article>
+
+        </main><footer id="footer">
+    Copyright © 2022-2023 arg.vc
+</footer>
+</body>
+</html>
